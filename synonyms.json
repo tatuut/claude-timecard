@@ -1,0 +1,14 @@
+{
+  "_comment": "同義語辞書（デフォルト）。正規形: [別名1, 別名2, ...]。ユーザー固有の同義語は ~/.config/claude-timecard/synonyms.json に追加。",
+  "template": ["テンプレート"],
+  "pipeline": ["パイプライン"],
+  "filter": ["フィルタ", "フィルター"],
+  "cost": ["コスト"],
+  "layer": ["レイヤー", "レイヤ"],
+  "cache": ["キャッシュ"],
+  "score": ["スコア"],
+  "threshold": ["閾値", "しきい値"],
+  "segment": ["セグメント"],
+  "node": ["ノード"],
+  "graph": ["グラフ"]
+}

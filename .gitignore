@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.claude/
+output/
+private/
+
+# 生成物
+*.png
+
+# 環境・設定
+.env
+.mcp.json
+.temp_files.json
+calibration.json
+
+# エディタ
+.vscode/
+.idea/
+*.swp

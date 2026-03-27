@@ -1,0 +1,68 @@
+"""全定数のfactory関数 + TimecardConfig dataclass."""
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from datetime import timezone, timedelta
+
+JST = timezone(timedelta(hours=9))
+
+# --- ANSI colors ---
+C_RESET = "\033[0m"
+C_BOLD = "\033[1m"
+C_DIM = "\033[2m"
+C_GREEN = "\033[32m"
+C_YELLOW = "\033[33m"
+C_BLUE = "\033[34m"
+C_CYAN = "\033[36m"
+C_MAGENTA = "\033[35m"
+C_RED = "\033[31m"
+C_BG_BLUE = "\033[44m"
+
+
+@dataclass
+class BreakTime:
+    """休憩時間."""
+
+    start: str  # "12:00"
+    end: str  # "13:00"
+    label: str  # "昼休み"
+
+
+@dataclass
+class TimecardConfig:
+    """タイムカード設定."""
+
+    idle_threshold_min: int = 20
+    per_turn_time_min: int = 5
+    kde_kernel: str = "gaussian"
+    kde_bandwidth_ratio: float = 0.015
+    merge_threshold: float = 0.55
+    max_cluster_size: int = 5
+    noise_df_ratio: float = 0.3
+    min_df_ratio: int = 5
+    break_times: list[BreakTime] = field(default_factory=list)
+    calibration_file: Path | None = None
+    # CLI options
+    project_filter: str | None = None
+    top_n: int = 10
+    ai_model: str = "haiku"
+    use_cache: bool = True
+
+    @classmethod
+    def from_args(cls, args) -> "TimecardConfig":
+        """argparseの結果からconfig生成."""
+        config = cls(
+            idle_threshold_min=args.idle,
+            per_turn_time_min=args.turn_time,
+            project_filter=args.project,
+            top_n=args.top_n,
+            ai_model=args.ai_model,
+            use_cache=not args.no_cache,
+        )
+        if hasattr(args, "calibration") and args.calibration:
+            config.calibration_file = Path(args.calibration)
+        if hasattr(args, "break_start") and args.break_start and args.break_end:
+            config.break_times.append(
+                BreakTime(start=args.break_start, end=args.break_end, label="休憩")
+            )
+        return config
