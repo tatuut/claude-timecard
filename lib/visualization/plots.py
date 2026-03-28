@@ -6,7 +6,7 @@ from collections import Counter
 from datetime import timedelta
 from pathlib import Path
 
-from ..config import C_GREEN, C_RESET
+from ..config import C_GREEN, C_RESET, ATTRIBUTION_SHORT
 from ..analysis.blocks import Block
 from ..analysis.tfidf import _tokenize
 
@@ -156,6 +156,8 @@ def plot_keyword_graph(
         framealpha=0.9, borderpad=1,
     )
 
+    fig.text(0.99, 0.01, ATTRIBUTION_SHORT, ha="right", va="bottom",
+             fontsize=6, color="#555", alpha=0.7)
     plt.tight_layout()
     plt.savefig(output, dpi=150, facecolor=fig.get_facecolor())
     plt.close()
@@ -266,6 +268,8 @@ def plot_keyword_ranking(
         spine.set_color("#333")
     ax2.grid(axis="x", color="#333", alpha=0.4, linestyle="--")
 
+    fig.text(0.99, 0.01, ATTRIBUTION_SHORT, ha="right", va="bottom",
+             fontsize=6, color="#555", alpha=0.7)
     plt.tight_layout()
     plt.savefig(output, dpi=150, facecolor=fig.get_facecolor())
     plt.close()
@@ -378,6 +382,8 @@ def plot_task_timeline(
             transform=ax.transAxes, color="#888", fontsize=7,
         )
 
+    fig.text(0.99, 0.01, ATTRIBUTION_SHORT, ha="right", va="bottom",
+             fontsize=6, color="#555", alpha=0.7)
     plt.tight_layout()
     plt.savefig(output, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close()
@@ -513,6 +519,8 @@ def plot_branch_timeline(
     title = f"ブランチタイムライン  {t_min.strftime('%m/%d')}〜{t_max.strftime('%m/%d')}"
     ax.set_title(title, color="white", fontsize=13, pad=12)
 
+    fig.text(0.99, 0.01, ATTRIBUTION_SHORT, ha="right", va="bottom",
+             fontsize=6, color="#555", alpha=0.7)
     plt.tight_layout()
     plt.savefig(output, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close()

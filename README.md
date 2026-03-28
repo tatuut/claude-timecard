@@ -102,6 +102,20 @@ python timecard.py --add-synonym review レビュー コードレビュー
 
 > 💡 Claude Codeと対話しながら「この用語を同義語に追加して」と頼むこともできる。MCPサーバー経由でtimecard CLIを呼び出せば、会話の中で登録が完了する。
 
+### Sudachi同義語辞書の一括インポート
+
+[Sudachi同義語辞書](https://github.com/WorksApplications/SudachiDict)（25,000グループ、Apache-2.0）を一括インポートできる:
+
+```bash
+# URLから直接インポート
+python timecard.py --import-sudachi https://raw.githubusercontent.com/WorksApplications/SudachiDict/develop/src/main/text/synonyms.txt
+
+# ローカルファイルからインポート
+python timecard.py --import-sudachi ~/Downloads/synonyms.txt
+```
+
+ユーザーローカル (`~/.config/claude-timecard/synonyms.json`) に保存される。既存の登録とマージされる。
+
 ### ストップワードの追加
 
 キーワードに出てほしくない語を除外:
@@ -212,4 +226,12 @@ MCPサーバー (`mcp_server.py`) は全ツール関数で `contextlib.redirect_
 
 ## 📄 ライセンス
 
-MIT
+**AGPL-3.0** — [全文](./LICENSE)
+
+| 利用形態 | 条件 |
+|---------|------|
+| 🙋 個人利用 | **無料**。AGPL-3.0の条件に従ってください |
+| 🏢 企業・組織利用 | **商用ライセンス**が必要（[詳細](./COMMERCIAL_LICENSE.md)） |
+| 🔧 派生物・改変 | ソースコードをAGPL-3.0で公開すれば無料で利用可能 |
+
+企業でソースを非公開のまま利用したい場合は[商用ライセンス](./COMMERCIAL_LICENSE.md)をお問い合わせください。

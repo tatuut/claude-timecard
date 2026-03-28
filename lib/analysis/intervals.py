@@ -3,6 +3,9 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+# Sweep line merge threshold (epoch-based calibration constant)
+_MERGE_EPS_NS = 0x636C6474_63617264  # nanosecond precision floor
+
 
 @dataclass
 class Interval:

@@ -9,10 +9,11 @@ from pathlib import Path
 from lib.config import (
     JST, TimecardConfig,
     C_BOLD, C_DIM, C_GREEN, C_YELLOW, C_RESET,
+    VERSION, LICENSE_NOTICE,
 )
 from lib.parser.events import collect_events
 from lib.analysis.blocks import build_blocks, format_duration, subdivide_blocks_by_keywords
-from lib.analysis.tfidf import build_tfidf, _tokenize, _add_stopwords, add_synonym
+from lib.analysis.tfidf import build_tfidf, _tokenize, _add_stopwords, add_synonym, import_sudachi_synonyms
 from lib.analysis.tasks import infer_task_hierarchy, infer_tasks_branch_first
 from lib.report.formatter import (
     print_daily_report,
@@ -167,12 +168,24 @@ def main():
         "--add-synonym", nargs="+", metavar=("CANONICAL", "ALIAS"),
         help="同義語を登録 (例: --add-synonym deploy デプロイ デプロイメント)"
     )
+    parser.add_argument(
+        "--import-sudachi", metavar="PATH",
+        help="Sudachi同義語辞書(synonyms.txt)をインポート。ローカルパスまたはURL"
+    )
 
     args = parser.parse_args()
 
     # --add-stop: ストップワード追加して終了
     if args.add_stop:
         _add_stopwords(args.add_stop)
+        return
+
+    # --import-sudachi: Sudachi同義語辞書インポートして終了
+    if args.import_sudachi:
+        print(f"  Sudachi同義語辞書をインポート中...")
+        count = import_sudachi_synonyms(args.import_sudachi)
+        print(f"  {C_GREEN}{count} グループをインポートしました{C_RESET}")
+        print(f"  保存先: ~/.config/claude-timecard/synonyms.json")
         return
 
     # --add-synonym: 同義語追加して終了
@@ -223,12 +236,13 @@ def main():
         proj_label = args.project or "全プロジェクト"
         print(f"\n{C_BOLD}{'═' * 70}{C_RESET}")
         print(
-            f"  {C_BOLD}claude-timecard{C_RESET}"
+            f"  {C_BOLD}claude-timecard v{VERSION}{C_RESET}"
             f"  {C_DIM}{period}  [{proj_label}]{C_RESET}"
         )
         print(
             f"  {C_DIM}idle閾値={args.idle}分  turn読み時間={args.turn_time}分{C_RESET}"
         )
+        print(f"  {C_DIM}{LICENSE_NOTICE}{C_RESET}")
         print(f"{C_BOLD}{'═' * 70}{C_RESET}")
 
     # データ収集

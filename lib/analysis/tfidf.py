@@ -70,6 +70,75 @@ def _load_synonyms() -> dict[str, str]:
     return mapping
 
 
+def import_sudachi_synonyms(path: str, min_group_size: int = 2) -> int:
+    """Sudachi同義語辞書CSVをインポートしてユーザーローカルに保存.
+
+    Args:
+        path: synonyms.txt のパス（またはURL）
+        min_group_size: 最小グループサイズ（1語のグループは無視）
+
+    Returns:
+        インポートされたグループ数
+    """
+    import csv
+    from io import StringIO
+
+    # ファイル読み込み（URLまたはローカルパス）
+    if path.startswith("http://") or path.startswith("https://"):
+        import urllib.request
+        resp = urllib.request.urlopen(path, timeout=30)
+        text = resp.read().decode("utf-8")
+    else:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+
+    # グループごとにパース
+    groups: dict[str, list[tuple[str, int]]] = {}  # group_id -> [(word, word_type)]
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(",")
+        if len(parts) < 9:
+            continue
+        group_id = parts[0]
+        word_type = int(parts[4]) if parts[4] else 0  # 0=代表語
+        word = parts[8]
+        if not word:
+            continue
+        if group_id not in groups:
+            groups[group_id] = []
+        groups[group_id].append((word, word_type))
+
+    # ユーザーローカル辞書にマージ
+    _SYNONYMS_USER.parent.mkdir(parents=True, exist_ok=True)
+    if _SYNONYMS_USER.exists():
+        with open(_SYNONYMS_USER, encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        data = {}
+
+    imported = 0
+    for group_id, words in groups.items():
+        if len(words) < min_group_size:
+            continue
+        # 代表語（word_type=0）を正規形とする
+        canonical_candidates = [w for w, t in words if t == 0]
+        canonical = canonical_candidates[0] if canonical_candidates else words[0][0]
+        aliases = [w for w, _ in words if w != canonical]
+        if not aliases:
+            continue
+        existing = set(data.get(canonical, []))
+        existing.update(aliases)
+        data[canonical] = sorted(existing)
+        imported += 1
+
+    with open(_SYNONYMS_USER, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    return imported
+
+
 def add_synonym(canonical: str, aliases: list[str]) -> None:
     """ユーザーローカルの同義語辞書に追加."""
     _SYNONYMS_USER.parent.mkdir(parents=True, exist_ok=True)

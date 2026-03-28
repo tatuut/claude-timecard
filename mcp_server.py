@@ -17,7 +17,7 @@ from mcp.server.fastmcp import FastMCP
 # lib をインポートパスに追加
 sys.path.insert(0, str(Path(__file__).parent))
 
-from lib.config import TimecardConfig, JST
+from lib.config import TimecardConfig, JST, ATTRIBUTION_SHORT
 from lib.parser.events import Event, collect_events, parse_timestamp
 from lib.analysis.blocks import Block, build_blocks, subdivide_blocks_by_keywords
 from lib.analysis.tfidf import build_tfidf, extract_keywords
@@ -32,6 +32,7 @@ mcp = FastMCP("claude-timecard")
 # --- helpers ---
 
 _PROJECTS_DIR = Path.home() / ".claude" / "projects"
+_META = {"tool": ATTRIBUTION_SHORT, "license": "AGPL-3.0"}
 
 
 def _parse_date(s: str) -> datetime:
@@ -182,6 +183,7 @@ def timecard_daily(
             "total_messages": len(events),
         }
         result["timing"] = timer.summary()
+        result["_meta"] = _META
 
     return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -230,6 +232,7 @@ def timecard_streams(
         sum_min = sum(s["active_minutes"] for s in streams)
 
     return json.dumps({
+        "_meta": _META,
         "streams": sorted(streams, key=lambda x: -x["active_minutes"]),
         "union_active_hours": round(union_min / 60, 1),
         "sum_active_hours": round(sum_min / 60, 1),
@@ -302,6 +305,7 @@ def timecard_tasks(
         )
 
     return json.dumps({
+        "_meta": _META,
         "tasks": tasks,
         "context_keywords": ctx_kws,
         "union_active_hours": round(union_min / 60, 1),
@@ -384,7 +388,7 @@ def timecard_graph(
         except Exception as e:
             generated.append({"type": "branch_timeline", "error": str(e)})
 
-    return json.dumps({"generated": generated}, ensure_ascii=False, indent=2)
+    return json.dumps({"_meta": _META, "generated": generated}, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
@@ -440,7 +444,7 @@ def timecard_keywords(
                 "total_blocks": len(blocks),
             })
 
-    return json.dumps({"keywords": keywords}, ensure_ascii=False, indent=2)
+    return json.dumps({"_meta": _META, "keywords": keywords}, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
@@ -485,6 +489,7 @@ def timecard_compare_months(
                 },
             }
 
+    results["_meta"] = _META
     return json.dumps(results, ensure_ascii=False, indent=2)
 
 
@@ -571,6 +576,7 @@ def timecard_report(
                 generated_files.append(str(task_path))
 
     return json.dumps({
+        "_meta": _META,
         "depth": depth,
         "report_path": output_path,
         "generated_files": generated_files,
@@ -626,6 +632,7 @@ def timecard_detail(
             })
 
     return json.dumps({
+        "_meta": _META,
         "total_blocks": len(block_details),
         "total_minutes": round(sum(b["duration_minutes"] for b in block_details), 1),
         "blocks": block_details,

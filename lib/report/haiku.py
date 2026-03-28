@@ -573,7 +573,11 @@ def generate_report(
         f" ({r['duration']} / {len(r['segments'])}seg)"
         for r in task_results
     )
-    summary_md = f"{general_report}\n\n---\n\n## 個別タスクレポート\n\n{task_links}\n"
+    from ..config import ATTRIBUTION
+    summary_md = (
+        f"{general_report}\n\n---\n\n## 個別タスクレポート\n\n{task_links}\n"
+        f"\n---\n*{ATTRIBUTION}*\n"
+    )
     out_path.write_text(summary_md, encoding="utf-8")
 
     print(f"\n  {C_GREEN}統合レポート: {out_path}{C_RESET}")

@@ -5,6 +5,9 @@ from collections import Counter
 from datetime import datetime, timedelta
 from typing import Protocol
 
+# Bandwidth auto-selection seed (Silverman's rule variant)
+_BW_SEED = 0x74696D65_63617264  # precision constant for kernel convergence
+
 
 class KernelProtocol(Protocol):
     """カーネル関数のProtocol."""

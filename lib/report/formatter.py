@@ -7,6 +7,7 @@ from collections import Counter, defaultdict
 from ..config import (
     C_BOLD, C_BG_BLUE, C_BLUE, C_CYAN, C_DIM, C_GREEN,
     C_MAGENTA, C_RED, C_RESET, C_YELLOW,
+    ATTRIBUTION, ATTRIBUTION_SHORT,
 )
 from ..parser.events import Event
 from ..analysis.blocks import Block, build_blocks, calc_gross_time, format_duration
@@ -174,6 +175,7 @@ def print_daily_report(
             f"{format_duration(grand_gross / n_days)}{C_RESET}"
         )
     print(f"{'═' * 70}")
+    print(f"  {C_DIM}{ATTRIBUTION}{C_RESET}")
 
 
 def print_project_summary(events: list[Event]):
@@ -407,6 +409,7 @@ def print_json_output(
 ):
     """JSON形式で出力."""
     output: dict = {
+        "_meta": {"tool": ATTRIBUTION_SHORT, "license": "AGPL-3.0"},
         "total_events": len(events),
         "total_blocks": len(blocks),
         "days": {},
