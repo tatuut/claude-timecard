@@ -13,6 +13,10 @@ private/
 .temp_files.json
 calibration.json
 
+# キャッシュ
+.pytest_cache/
+.ruff_cache/
+
 # エディタ
 .vscode/
 .idea/
