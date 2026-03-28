@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .claude/
+!.claude/skills/
 output/
 private/
 

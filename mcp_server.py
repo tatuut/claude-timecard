@@ -640,5 +640,139 @@ def timecard_detail(
     }, ensure_ascii=False, indent=2)
 
 
+@mcp.tool()
+def timecard_daily_report(
+    start: str = "7d",
+    end: str | None = None,
+    project: str | None = None,
+    report_dir: str | None = None,
+) -> str:
+    """日別Active時間にAIレポートのセグメント要約を紐付けて返す。
+
+    timecard_report で生成済みのレポートファイルがある場合、各日のブロックに対応する
+    セグメントの内容を読み込んで付与する。レポートがない場合はブランチ名+キーワードのみ。
+
+    タイムシート作成の「作業内容」欄を書くために使う。
+
+    Args:
+        start: 開始日
+        end: 終了日
+        project: プロジェクト名フィルタ
+        report_dir: レポートが格納されたディレクトリ (output/YYYYMMDD_HHMMSS)。省略時は最新を自動検索
+    """
+    with contextlib.redirect_stdout(sys.stderr):
+        events, blocks, tfidf = _load_data(start, end, project)
+        if not events:
+            return json.dumps({"error": "該当期間のデータがありません"}, ensure_ascii=False)
+
+        config = TimecardConfig()
+
+        # タスク推定
+        task_nodes, ctx_kws = infer_tasks_branch_first(
+            events, blocks, tfidf=tfidf,
+            idle_threshold=config.idle_threshold_min,
+            per_turn_time=config.per_turn_time_min,
+        )
+
+        # セグメント → 日付マッピングを構築
+        from lib.report.haiku import _segment_task_blocks
+        seg_map: list[dict] = []  # [{task_index, seg_index, dates, block_idxs, keywords, branches}]
+
+        for ti, task in enumerate(task_nodes, 1):
+            segments = _segment_task_blocks(task, blocks)
+            for si, seg_idxs in enumerate(segments, 1):
+                seg_dates = sorted({blocks[bi].start.strftime("%Y-%m-%d") for bi in seg_idxs})
+                seg_start = blocks[seg_idxs[0]].start
+                seg_end = blocks[seg_idxs[-1]].end
+                seg_dur = sum(
+                    (blocks[bi].end - blocks[bi].start).total_seconds() / 60
+                    for bi in seg_idxs
+                )
+                seg_map.append({
+                    "task_index": ti,
+                    "seg_index": si,
+                    "keywords": task.keywords[:5],
+                    "branches": task.branches[:3] if hasattr(task, "branches") else [],
+                    "dates": seg_dates,
+                    "time_range": f"{seg_start.strftime('%m/%d %H:%M')}~{seg_end.strftime('%m/%d %H:%M')}",
+                    "duration_minutes": round(seg_dur, 1),
+                    "block_count": len(seg_idxs),
+                })
+
+        # レポートファイルの検索・読み込み
+        report_contents: dict[str, str] = {}  # "task{ti}_seg{si}" → content
+        if report_dir:
+            rdir = Path(report_dir)
+        else:
+            # output/ 配下の最新ディレクトリを探す
+            output_base = Path(__file__).parent / "output"
+            if output_base.exists():
+                subdirs = sorted(output_base.iterdir(), reverse=True)
+                rdir = subdirs[0] if subdirs else None
+            else:
+                rdir = None
+
+        if rdir and rdir.exists():
+            for md_file in rdir.glob("*_task*_seg*.md"):
+                report_contents[md_file.stem.split("_", 1)[1]] = md_file.read_text(encoding="utf-8")
+            # タスクまとめファイルも読む
+            for md_file in rdir.glob("*_task[0-9]*.md"):
+                if "_seg" not in md_file.name:
+                    key = md_file.stem.split("_", 1)[1]
+                    report_contents[key] = md_file.read_text(encoding="utf-8")
+
+        # セグメントにレポート内容を付与
+        for seg in seg_map:
+            ti, si = seg["task_index"], seg["seg_index"]
+            seg_key = f"task{ti}_seg{si}"
+            task_key = f"task{ti}"
+            seg["report_segment"] = report_contents.get(seg_key, None)
+            seg["report_task_summary"] = report_contents.get(task_key, None)
+
+        # 日別にグループ化
+        daily: dict[str, dict] = {}
+        for b in blocks:
+            date_key = b.start.strftime("%Y-%m-%d")
+            if date_key not in daily:
+                daily[date_key] = {"active_minutes": 0.0, "blocks": 0, "segments": []}
+            daily[date_key]["active_minutes"] += (b.end - b.start).total_seconds() / 60
+            daily[date_key]["blocks"] += 1
+
+        for seg in seg_map:
+            for date in seg["dates"]:
+                if date in daily:
+                    daily[date]["segments"].append({
+                        "task_index": seg["task_index"],
+                        "seg_index": seg["seg_index"],
+                        "keywords": seg["keywords"],
+                        "branches": seg["branches"],
+                        "time_range": seg["time_range"],
+                        "duration_minutes": seg["duration_minutes"],
+                        "has_report": seg["report_segment"] is not None,
+                        "report_excerpt": (
+                            seg["report_segment"][:500] if seg["report_segment"] else None
+                        ),
+                    })
+
+        # 日付ソートして返す
+        result_days = {}
+        for date in sorted(daily.keys()):
+            d = daily[date]
+            result_days[date] = {
+                "active_hours": round(d["active_minutes"] / 60, 1),
+                "active_minutes": round(d["active_minutes"], 1),
+                "blocks": d["blocks"],
+                "segments": d["segments"],
+            }
+
+    return json.dumps({
+        "_meta": _META,
+        "days": result_days,
+        "total_segments": len(seg_map),
+        "report_dir": str(rdir) if rdir else None,
+        "report_files_found": len(report_contents),
+    }, ensure_ascii=False, indent=2)
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")
