@@ -131,6 +131,7 @@ def timecard_daily(
     start: str = "7d",
     end: str | None = None,
     project: str | None = None,
+    include_details: bool = False,
 ) -> str:
     """日別の作業時間レポートをJSON形式で返す。
 
@@ -138,6 +139,7 @@ def timecard_daily(
         start: 開始日 (YYYY-MM-DD) または相対日数 (例: "7d", "14d", "30d")
         end: 終了日 (YYYY-MM-DD)。省略時は今日まで
         project: プロジェクト名フィルタ (部分一致)。例: "myproject"
+        include_details: trueにするとブロックごとの詳細（時間帯・ブランチ・キーワード）を含める。デフォルトはfalseでサマリーのみ（レスポンスが大幅に小さくなる）
     """
     with contextlib.redirect_stdout(sys.stderr):
         timer = Timer()
@@ -158,12 +160,15 @@ def timecard_daily(
             active_min = sum((b.end - b.start).total_seconds() / 60 for b in day_blocks)
             grand_active += active_min
 
-            result["days"][date_key] = {
+            day_entry: dict = {
                 "active_hours": round(active_min / 60, 1),
                 "active_minutes": round(active_min, 1),
                 "turns": sum(b.turns for b in day_blocks),
                 "blocks": len(day_blocks),
-                "block_details": [
+            }
+
+            if include_details:
+                day_entry["block_details"] = [
                     {
                         "time": f"{b.start.strftime('%H:%M')}~{b.end.strftime('%H:%M')}",
                         "duration_min": round((b.end - b.start).total_seconds() / 60),
@@ -172,8 +177,9 @@ def timecard_daily(
                         "turns": b.turns,
                     }
                     for b in day_blocks
-                ],
-            }
+                ]
+
+            result["days"][date_key] = day_entry
 
         n_days = len(daily_blocks)
         result["summary"] = {
