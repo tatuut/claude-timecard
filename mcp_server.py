@@ -1,4 +1,9 @@
-"""claude-timecard MCP Server: Claude CodeからtimecardデータにアクセスするMCPサーバー.
+"""claude-timecard MCP Server: 3ツール構成.
+
+ユーザー向けツール:
+  1. timecard_day     — 特定日の全部入りビュー
+  2. timecard_conversation — 会話内容の切り出し
+  3. timecard_register — 同義語/ストップワード登録
 
 MCP stdio transportはstdoutをJSON-RPCに使うため、
 lib/内のprint()がstdoutに出るとプロトコルが壊れてハングする。
@@ -7,8 +12,11 @@ lib/内のprint()がstdoutに出るとプロトコルが壊れてハングする
 
 import contextlib
 import json
+import re
+import subprocess
 import sys
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -19,21 +27,23 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from lib.config import TimecardConfig, JST, ATTRIBUTION_SHORT
 from lib.parser.events import Event, collect_events, parse_timestamp
-from lib.analysis.blocks import Block, build_blocks, subdivide_blocks_by_keywords
-from lib.analysis.tfidf import build_tfidf, extract_keywords
-from lib.analysis.streams import group_by_stream, build_stream_blocks
-from lib.analysis.intervals import Interval, measure_union
-from lib.analysis.tasks import infer_tasks_branch_first, infer_task_hierarchy
-from lib.report.formatter import format_duration
+from lib.analysis.blocks import Block, build_blocks, subdivide_blocks_by_keywords, format_duration
+from lib.analysis.tfidf import (
+    build_tfidf, extract_keywords, _tokenize,
+    _add_stopwords, add_synonym, import_sudachi_synonyms,
+)
+from lib.analysis.tasks import infer_tasks_branch_first
 from lib.timing import Timer
 
 mcp = FastMCP("claude-timecard")
 
-# --- helpers ---
+# --- constants ---
 
 _PROJECTS_DIR = Path.home() / ".claude" / "projects"
 _META = {"tool": ATTRIBUTION_SHORT, "license": "AGPL-3.0"}
 
+
+# --- internal helpers ---
 
 def _parse_date(s: str) -> datetime:
     if s.endswith("d"):
@@ -49,7 +59,6 @@ def _load_data(
     end: str | None = None,
     project: str | None = None,
     config: TimecardConfig | None = None,
-    timer: Timer | None = None,
 ) -> tuple[list[Event], list[Block], dict[str, float]]:
     """共通のデータロード処理."""
     if config is None:
@@ -58,34 +67,16 @@ def _load_data(
     date_start = _parse_date(start)
     date_end = _parse_date(end) + timedelta(days=1) if end else datetime.now(JST) + timedelta(days=1)
 
-    if timer:
-        ctx = timer.measure("collect_events")
-        ctx.__enter__()
     events = collect_events(_PROJECTS_DIR, date_start, date_end, project)
-    if timer:
-        ctx.__exit__(None, None, None)
-
     if not events:
         return [], [], {}
 
-    if timer:
-        ctx = timer.measure("build_blocks")
-        ctx.__enter__()
     blocks = build_blocks(events, config.idle_threshold_min, config.per_turn_time_min)
-    if timer:
-        ctx.__exit__(None, None, None)
-
-    if timer:
-        ctx = timer.measure("build_tfidf")
-        ctx.__enter__()
     tfidf = build_tfidf(blocks)
-    if timer:
-        ctx.__exit__(None, None, None)
 
     # ノイズ除去
     n_blocks = len(blocks)
     if n_blocks >= 4:
-        from lib.analysis.tfidf import _tokenize
         block_vocabs = []
         for b in blocks:
             vocab = set()
@@ -99,14 +90,7 @@ def _load_data(
         noise_words = {w for w, c in df.items() if c / n_blocks > 0.3}
         tfidf = {w: s for w, s in tfidf.items() if w not in noise_words}
 
-    # キーワード細分化
-    if timer:
-        ctx = timer.measure("subdivide_blocks")
-        ctx.__enter__()
     blocks = subdivide_blocks_by_keywords(blocks, tfidf)
-    if timer:
-        ctx.__exit__(None, None, None)
-
     return events, blocks, tfidf
 
 
@@ -118,666 +102,494 @@ def _block_branch_summary(branches: list[str]) -> str:
         return ""
     counts = Counter(meaningful)
     top = counts.most_common(1)
-    return top[0][0].split("/")[-1] if top else ""
+    return top[0][0] if top else ""
 
 
-# --- MCP Tools ---
-# 全ツールで contextlib.redirect_stdout(sys.stderr) を使い、
-# lib/内のprint()がMCP transportを壊すのを防止する。
+def _resolve_project_dir(project_name: str) -> Path | None:
+    """プロジェクト名からgitリポジトリのパスを推定."""
+    # Claude Codeのプロジェクトdir名: C--Users-tatut-Documents-xxx → C:\Users\tatut\Documents\xxx
+    for proj_dir in _PROJECTS_DIR.iterdir():
+        if not proj_dir.is_dir():
+            continue
+        if project_name.lower() in proj_dir.name.lower():
+            # dir名からパスを復元
+            name = proj_dir.name
+            # C--Users-xxx → C:\Users\xxx
+            path_str = re.sub(r"^([A-Z])--", r"\1:\\", name)
+            path_str = path_str.replace("-", "\\")
+            # ハイフンを含むディレクトリ名のために、存在チェックしながら復元
+            candidate = Path(path_str)
+            if candidate.exists():
+                return candidate
+            # fallback: よくあるパターンを試す
+            # Documents配下を探す
+            docs = Path.home() / "Documents"
+            for d in docs.iterdir():
+                if d.is_dir() and project_name.lower() in d.name.lower():
+                    return d
+    return None
 
 
-@mcp.tool()
-def timecard_daily(
-    start: str = "7d",
-    end: str | None = None,
-    project: str | None = None,
-    include_details: bool = False,
-) -> str:
-    """日別の作業時間レポートをJSON形式で返す。
-
-    Args:
-        start: 開始日 (YYYY-MM-DD) または相対日数 (例: "7d", "14d", "30d")
-        end: 終了日 (YYYY-MM-DD)。省略時は今日まで
-        project: プロジェクト名フィルタ (部分一致)。例: "myproject"
-        include_details: trueにするとブロックごとの詳細（時間帯・ブランチ・キーワード）を含める。デフォルトはfalseでサマリーのみ（レスポンスが大幅に小さくなる）
-    """
-    with contextlib.redirect_stdout(sys.stderr):
-        timer = Timer()
-        events, blocks, tfidf = _load_data(start, end, project, timer=timer)
-        if not events:
-            return json.dumps({"error": "該当期間のデータがありません"}, ensure_ascii=False)
-
-        daily_blocks: dict[str, list[Block]] = defaultdict(list)
-        for b in blocks:
-            date_key = b.start.strftime("%Y-%m-%d")
-            daily_blocks[date_key].append(b)
-
-        result = {"days": {}, "summary": {}}
-        grand_active = 0.0
-
-        for date_key in sorted(daily_blocks.keys()):
-            day_blocks = daily_blocks[date_key]
-            active_min = sum((b.end - b.start).total_seconds() / 60 for b in day_blocks)
-            grand_active += active_min
-
-            day_entry: dict = {
-                "active_hours": round(active_min / 60, 1),
-                "active_minutes": round(active_min, 1),
-                "turns": sum(b.turns for b in day_blocks),
-                "blocks": len(day_blocks),
-            }
-
-            if include_details:
-                day_entry["block_details"] = [
-                    {
-                        "time": f"{b.start.strftime('%H:%M')}~{b.end.strftime('%H:%M')}",
-                        "duration_min": round((b.end - b.start).total_seconds() / 60),
-                        "branch": _block_branch_summary(b.branches),
-                        "keywords": [w for w, _ in extract_keywords(b.messages, 4, tfidf)],
-                        "turns": b.turns,
-                    }
-                    for b in day_blocks
-                ]
-
-            result["days"][date_key] = day_entry
-
-        n_days = len(daily_blocks)
-        result["summary"] = {
-            "total_active_hours": round(grand_active / 60, 1),
-            "working_days": n_days,
-            "avg_daily_hours": round(grand_active / 60 / max(n_days, 1), 1),
-            "total_messages": len(events),
-        }
-        result["timing"] = timer.summary()
-        result["_meta"] = _META
-
-    return json.dumps(result, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-def timecard_streams(
-    start: str = "7d",
-    end: str | None = None,
-    project: str | None = None,
-) -> str:
-    """ストリーム（project×branch）別の作業時間分析をJSON形式で返す。
-
-    各ブランチでの作業時間、union-of-intervalsによる重複除去後の合計を含む。
-
-    Args:
-        start: 開始日 (YYYY-MM-DD) または相対日数
-        end: 終了日 (YYYY-MM-DD)
-        project: プロジェクト名フィルタ
-    """
-    with contextlib.redirect_stdout(sys.stderr):
-        events, blocks, tfidf = _load_data(start, end, project)
-        if not events:
-            return json.dumps({"error": "該当期間のデータがありません"}, ensure_ascii=False)
-
-        config = TimecardConfig()
-        stream_blocks = build_stream_blocks(events, config)
-
-        streams = []
-        all_intervals = []
-
-        for (proj, branch), sblocks in sorted(stream_blocks.items()):
-            active = sum((b.end - b.start).total_seconds() / 60 for b in sblocks)
-            branch_short = branch.split("/")[-1] if "/" in branch else branch
-            streams.append({
-                "project": proj,
-                "branch": branch_short,
-                "branch_full": branch,
-                "active_hours": round(active / 60, 1),
-                "active_minutes": round(active, 1),
-                "blocks": len(sblocks),
-            })
-            for b in sblocks:
-                all_intervals.append(Interval(start=b.start, end=b.end, stream=(proj, branch)))
-
-        union_min = measure_union(all_intervals)
-        sum_min = sum(s["active_minutes"] for s in streams)
-
-    return json.dumps({
-        "_meta": _META,
-        "streams": sorted(streams, key=lambda x: -x["active_minutes"]),
-        "union_active_hours": round(union_min / 60, 1),
-        "sum_active_hours": round(sum_min / 60, 1),
-        "overlap_minutes": round(sum_min - union_min, 1),
-    }, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-def timecard_tasks(
-    start: str = "7d",
-    end: str | None = None,
-    project: str | None = None,
-    mode: str = "branch",
-) -> str:
-    """タスク推定結果をJSON形式で返す。
-
-    ブランチ名とキーワード分析を組み合わせてタスクを自動推定する。
-
-    Args:
-        start: 開始日
-        end: 終了日
-        project: プロジェクト名フィルタ
-        mode: "branch" (ブランチベース、デフォルト) or "keyword" (キーワードベース、旧方式)
-    """
-    with contextlib.redirect_stdout(sys.stderr):
-        timer = Timer()
-        events, blocks, tfidf = _load_data(start, end, project, timer=timer)
-        if not events:
-            return json.dumps({"error": "該当期間のデータがありません"}, ensure_ascii=False)
-
-        config = TimecardConfig()
-
-        with timer.measure("infer_tasks"):
-            if mode == "branch":
-                task_nodes, ctx_kws = infer_tasks_branch_first(
-                    events, blocks, tfidf=tfidf,
-                    idle_threshold=config.idle_threshold_min,
-                    per_turn_time=config.per_turn_time_min,
-                )
-            else:
-                task_nodes, ctx_kws = infer_task_hierarchy(blocks, tfidf=tfidf)
-
-        tasks = []
-        for t in task_nodes:
-            tasks.append({
-                "keywords": t.keywords,
-                "branches": t.branches if hasattr(t, "branches") else [],
-                "active_hours": round(t.active_minutes / 60, 1),
-                "active_minutes": round(t.active_minutes, 1),
-                "sigma_minutes": round(t.sigma_minutes, 1),
-                "blocks": len(t.block_set),
-                "peak_times": t.peak_times[:5],
-                "children": [
-                    {
-                        "keywords": c.keywords,
-                        "active_hours": round(c.active_minutes / 60, 1),
-                        "relationship": c.relationship,
-                    }
-                    for c in t.children
-                ],
-            })
-
-        all_blocks_union = set()
-        for t in task_nodes:
-            all_blocks_union |= t.block_set
-        union_min = sum(
-            (blocks[bi].end - blocks[bi].start).total_seconds() / 60
-            for bi in all_blocks_union
-            if bi < len(blocks)
+def _get_git_commits(repo_dir: Path, branch: str, date: str) -> list[dict]:
+    """指定日・ブランチのgitコミットを取得."""
+    try:
+        result = subprocess.run(
+            ["git", "log", f"--after={date} 00:00", f"--before={date} 23:59",
+             "--all", f"--grep=", "--format=%H|%s|%an|%ai",
+             "--", "."],
+            capture_output=True, text=True, timeout=10,
+            cwd=str(repo_dir),
         )
+        if result.returncode != 0:
+            return []
 
-    return json.dumps({
-        "_meta": _META,
-        "tasks": tasks,
-        "context_keywords": ctx_kws,
-        "union_active_hours": round(union_min / 60, 1),
-        "mode": mode,
-        "timing": timer.summary(),
-    }, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-def timecard_graph(
-    start: str = "7d",
-    end: str | None = None,
-    project: str | None = None,
-    output_dir: str | None = None,
-) -> str:
-    """KDE密度曲線・タスクタイムライン・ブランチタイムライン・キーワードランキングのPNGグラフを生成する。
-
-    output/{YYYYMMDD_HHMMSS}/ ディレクトリに出力。
-
-    Args:
-        start: 開始日
-        end: 終了日
-        project: プロジェクト名フィルタ
-        output_dir: 出力ベースディレクトリ。省略時はtimecardプロジェクトのoutput/
-    """
-    with contextlib.redirect_stdout(sys.stderr):
-        events, blocks, tfidf = _load_data(start, end, project)
-        if not events:
-            return json.dumps({"error": "該当期間のデータがありません"}, ensure_ascii=False)
-
-        ts = datetime.now(JST).strftime("%Y%m%d_%H%M%S")
-        if output_dir:
-            out_dir = Path(output_dir) / ts
-        else:
-            out_dir = Path(__file__).parent / "output" / ts
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        config = TimecardConfig()
-        generated = []
-
-        # 1. KDE密度曲線
-        try:
-            from lib.visualization.plots import plot_keyword_graph
-            p = str(out_dir / "kde_density.png")
-            plot_keyword_graph(blocks, tfidf=tfidf, top_n=10, output=p)
-            generated.append({"type": "kde_density", "path": p})
-        except Exception as e:
-            generated.append({"type": "kde_density", "error": str(e)})
-
-        # 2. キーワードランキング
-        try:
-            from lib.visualization.plots import plot_keyword_ranking
-            p = str(out_dir / "keyword_ranking.png")
-            plot_keyword_ranking(blocks, tfidf=tfidf, top_n=20, output=p)
-            generated.append({"type": "keyword_ranking", "path": p})
-        except Exception as e:
-            generated.append({"type": "keyword_ranking", "error": str(e)})
-
-        # 3. タスクタイムライン
-        try:
-            from lib.visualization.plots import plot_task_timeline
-            task_nodes, ctx_kws = infer_tasks_branch_first(
-                events, blocks, tfidf=tfidf,
-                idle_threshold=config.idle_threshold_min,
-                per_turn_time=config.per_turn_time_min,
-            )
-            p = str(out_dir / "task_timeline.png")
-            plot_task_timeline(task_nodes, blocks, context_keywords=ctx_kws, output=p)
-            generated.append({"type": "task_timeline", "path": p})
-        except Exception as e:
-            generated.append({"type": "task_timeline", "error": str(e)})
-
-        # 4. ブランチタイムライン
-        try:
-            from lib.visualization.plots import plot_branch_timeline
-            stream_blocks = build_stream_blocks(events, config)
-            p = str(out_dir / "branch_timeline.png")
-            plot_branch_timeline(stream_blocks, output=p)
-            generated.append({"type": "branch_timeline", "path": p})
-        except Exception as e:
-            generated.append({"type": "branch_timeline", "error": str(e)})
-
-    return json.dumps({"_meta": _META, "generated": generated}, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-def timecard_keywords(
-    start: str = "7d",
-    end: str | None = None,
-    project: str | None = None,
-    top_n: int = 20,
-) -> str:
-    """期間中のキーワード頻度分析をJSON形式で返す。
-
-    TF-IDFスコアで重み付けされた上位キーワードと出現ブロック数を含む。
-
-    Args:
-        start: 開始日
-        end: 終了日
-        project: プロジェクト名フィルタ
-        top_n: 返すキーワード数
-    """
-    with contextlib.redirect_stdout(sys.stderr):
-        events, blocks, tfidf = _load_data(start, end, project)
-        if not events:
-            return json.dumps({"error": "該当期間のデータがありません"}, ensure_ascii=False)
-
-        from lib.analysis.tfidf import _tokenize
-
-        block_word_counts = []
-        for b in blocks:
-            wc = Counter()
-            for msg in b.messages:
-                for token in _tokenize(msg):
-                    wc[token] += 1
-            block_word_counts.append(wc)
-
-        word_df = Counter()
-        for wc in block_word_counts:
-            for w in wc:
-                word_df[w] += 1
-
-        total_tf = Counter()
-        for wc in block_word_counts:
-            total_tf.update(wc)
-
-        ranked = sorted(tfidf.items(), key=lambda x: -x[1])[:top_n]
-
-        keywords = []
-        for word, score in ranked:
-            keywords.append({
-                "word": word,
-                "tfidf_score": round(score, 2),
-                "total_count": total_tf.get(word, 0),
-                "block_count": word_df.get(word, 0),
-                "total_blocks": len(blocks),
-            })
-
-    return json.dumps({"_meta": _META, "keywords": keywords}, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-def timecard_compare_months(
-    month1: str,
-    month2: str,
-    project: str | None = None,
-) -> str:
-    """2つの月の作業時間を比較する。
-
-    Args:
-        month1: 比較元の月 (YYYY-MM 形式、例: "2026-02")
-        month2: 比較先の月 (YYYY-MM 形式、例: "2026-03")
-        project: プロジェクト名フィルタ
-    """
-    with contextlib.redirect_stdout(sys.stderr):
-        results = {}
-        for label, month in [("month1", month1), ("month2", month2)]:
-            year, mon = month.split("-")
-            start = f"{year}-{mon}-01"
-            if int(mon) == 12:
-                end_date = f"{int(year)+1}-01-01"
-            else:
-                end_date = f"{year}-{int(mon)+1:02d}-01"
-
-            events, blocks, tfidf = _load_data(start, end_date, project)
-
-            daily_blocks: dict[str, float] = defaultdict(float)
-            for b in blocks:
-                date_key = b.start.strftime("%Y-%m-%d")
-                daily_blocks[date_key] += (b.end - b.start).total_seconds() / 60
-
-            total_min = sum(daily_blocks.values())
-            results[label] = {
-                "month": month,
-                "total_active_hours": round(total_min / 60, 1),
-                "working_days": len(daily_blocks),
-                "avg_daily_hours": round(total_min / 60 / max(len(daily_blocks), 1), 1),
-                "total_messages": len(events),
-                "daily": {
-                    k: round(v / 60, 1) for k, v in sorted(daily_blocks.items())
-                },
-            }
-
-    results["_meta"] = _META
-    return json.dumps(results, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-def timecard_report(
-    start: str = "7d",
-    end: str | None = None,
-    project: str | None = None,
-    model: str = "haiku",
-    depth: str = "full",
-    output_dir: str | None = None,
-) -> str:
-    """AIレポートを生成する。depthで生成量を制御可能。
-
-    Args:
-        start: 開始日
-        end: 終了日
-        project: プロジェクト名フィルタ
-        model: AIモデル (default: "haiku")
-        depth: レポート深度。"full"=全3階層, "tasks-only"=タスクまとめのみ(セグメント省略), "structure-only"=AI不使用(構造分析のみ)
-        output_dir: Markdown出力先ディレクトリ
-    """
-    with contextlib.redirect_stdout(sys.stderr):
-        events, blocks, tfidf = _load_data(start, end, project)
-        if not events:
-            return json.dumps({"error": "該当期間のデータがありません"}, ensure_ascii=False)
-
-        config = TimecardConfig()
-
-        task_nodes, ctx_kws = infer_tasks_branch_first(
-            events, blocks, tfidf=tfidf,
-            idle_threshold=config.idle_threshold_min,
-            per_turn_time=config.per_turn_time_min,
+        # ブランチ名でフィルタ（完全一致は難しいのでコミットメッセージ+ブランチ含む）
+        # 代わりにその日の全コミットを取得してブランチ名をgrepで絞る
+        result2 = subprocess.run(
+            ["git", "log", f"--after={date} 00:00", f"--before={date} 23:59",
+             "--all", "--format=%H|%s|%an|%ai", "--numstat"],
+            capture_output=True, text=True, timeout=10,
+            cwd=str(repo_dir),
         )
+        if result2.returncode != 0:
+            return []
 
-        if not task_nodes:
-            return json.dumps({"error": "タスクを推定できませんでした"}, ensure_ascii=False)
-
-        ts = datetime.now(JST).strftime("%Y%m%d_%H%M%S")
-        if output_dir:
-            out_dir = Path(output_dir) / ts
-        else:
-            out_dir = Path(__file__).parent / "output" / ts
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        # structure-only: AIを使わず構造だけ返す
-        if depth == "structure-only":
-            structure = []
-            for ti, task in enumerate(task_nodes, 1):
-                from lib.report.haiku import _segment_task_blocks
-                segments = _segment_task_blocks(task, blocks)
-                structure.append({
-                    "task_index": ti,
-                    "keywords": task.keywords,
-                    "branches": task.branches if hasattr(task, "branches") else [],
-                    "active_hours": round(task.active_minutes / 60, 1),
-                    "segments": len(segments),
-                    "blocks": len(task.block_set),
-                })
-            return json.dumps({
-                "depth": "structure-only",
-                "tasks": structure,
-                "context_keywords": ctx_kws,
-                "note": "AI未使用。構造分析のみ。",
-            }, ensure_ascii=False, indent=2)
-
-        output_path = str(out_dir / "report.md")
-
-        from lib.report.haiku import generate_report
-        generate_report(
-            task_nodes,
-            blocks,
-            context_keywords=ctx_kws,
-            model=model,
-            output=output_path,
-            use_cache=True,
-        )
-
-        stem = Path(output_path).stem
-        generated_files = [output_path]
-        for ti, task in enumerate(task_nodes, 1):
-            task_path = out_dir / f"{stem}_task{ti}.md"
-            if task_path.exists():
-                generated_files.append(str(task_path))
-
-    return json.dumps({
-        "_meta": _META,
-        "depth": depth,
-        "report_path": output_path,
-        "generated_files": generated_files,
-        "tasks": len(task_nodes),
-        "model": model,
-    }, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-def timecard_detail(
-    start: str = "7d",
-    end: str | None = None,
-    project: str | None = None,
-    date: str | None = None,
-) -> str:
-    """最も細かい粒度のブロック分析を返す。キーワード細分化後の全ブロック情報を含む。
-
-    各ブロックのメッセージ数、キーワード、ブランチ、時間帯を返す。
-    dateを指定すると特定の日のみ。
-
-    Args:
-        start: 開始日
-        end: 終了日
-        project: プロジェクト名フィルタ
-        date: 特定日のみ取得 (YYYY-MM-DD)
-    """
-    with contextlib.redirect_stdout(sys.stderr):
-        timer = Timer()
-        events, blocks, tfidf = _load_data(start, end, project, timer=timer)
-        if not events:
-            return json.dumps({"error": "該当期間のデータがありません"}, ensure_ascii=False)
-
-        if date:
-            blocks = [b for b in blocks if b.start.strftime("%Y-%m-%d") == date]
-
-        block_details = []
-        for b in blocks:
-            kw = extract_keywords(b.messages, top_n=6, tfidf_scores=tfidf)
-            branch = _block_branch_summary(b.branches)
-            dur_min = (b.end - b.start).total_seconds() / 60
-
-            block_details.append({
-                "date": b.start.strftime("%Y-%m-%d"),
-                "start": b.start.strftime("%H:%M"),
-                "end": b.end.strftime("%H:%M"),
-                "duration_minutes": round(dur_min, 1),
-                "branch": branch,
-                "projects": sorted(b.projects),
-                "keywords": [{"word": w, "count": c} for w, c in kw],
-                "turns": b.turns,
-                "message_count": len(b.messages),
-                "pr_numbers": sorted(set(b.pr_numbers)),
-            })
-
-    return json.dumps({
-        "_meta": _META,
-        "total_blocks": len(block_details),
-        "total_minutes": round(sum(b["duration_minutes"] for b in block_details), 1),
-        "blocks": block_details,
-        "timing": timer.summary(),
-    }, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-def timecard_daily_report(
-    start: str = "7d",
-    end: str | None = None,
-    project: str | None = None,
-    report_dir: str | None = None,
-) -> str:
-    """日別Active時間にAIレポートのセグメント要約を紐付けて返す。
-
-    timecard_report で生成済みのレポートファイルがある場合、各日のブロックに対応する
-    セグメントの内容を読み込んで付与する。レポートがない場合はブランチ名+キーワードのみ。
-
-    タイムシート作成の「作業内容」欄を書くために使う。
-
-    Args:
-        start: 開始日
-        end: 終了日
-        project: プロジェクト名フィルタ
-        report_dir: レポートが格納されたディレクトリ (output/YYYYMMDD_HHMMSS)。省略時は最新を自動検索
-    """
-    with contextlib.redirect_stdout(sys.stderr):
-        events, blocks, tfidf = _load_data(start, end, project)
-        if not events:
-            return json.dumps({"error": "該当期間のデータがありません"}, ensure_ascii=False)
-
-        config = TimecardConfig()
-
-        # タスク推定
-        task_nodes, ctx_kws = infer_tasks_branch_first(
-            events, blocks, tfidf=tfidf,
-            idle_threshold=config.idle_threshold_min,
-            per_turn_time=config.per_turn_time_min,
-        )
-
-        # セグメント → 日付マッピングを構築
-        from lib.report.haiku import _segment_task_blocks
-        seg_map: list[dict] = []  # [{task_index, seg_index, dates, block_idxs, keywords, branches}]
-
-        for ti, task in enumerate(task_nodes, 1):
-            segments = _segment_task_blocks(task, blocks)
-            for si, seg_idxs in enumerate(segments, 1):
-                seg_dates = sorted({blocks[bi].start.strftime("%Y-%m-%d") for bi in seg_idxs})
-                seg_start = blocks[seg_idxs[0]].start
-                seg_end = blocks[seg_idxs[-1]].end
-                seg_dur = sum(
-                    (blocks[bi].end - blocks[bi].start).total_seconds() / 60
-                    for bi in seg_idxs
-                )
-                seg_map.append({
-                    "task_index": ti,
-                    "seg_index": si,
-                    "keywords": task.keywords[:5],
-                    "branches": task.branches[:3] if hasattr(task, "branches") else [],
-                    "dates": seg_dates,
-                    "time_range": f"{seg_start.strftime('%m/%d %H:%M')}~{seg_end.strftime('%m/%d %H:%M')}",
-                    "duration_minutes": round(seg_dur, 1),
-                    "block_count": len(seg_idxs),
-                })
-
-        # レポートファイルの検索・読み込み
-        report_contents: dict[str, str] = {}  # "task{ti}_seg{si}" → content
-        if report_dir:
-            rdir = Path(report_dir)
-        else:
-            # output/ 配下の最新ディレクトリを探す
-            output_base = Path(__file__).parent / "output"
-            if output_base.exists():
-                subdirs = sorted(output_base.iterdir(), reverse=True)
-                rdir = subdirs[0] if subdirs else None
-            else:
-                rdir = None
-
-        if rdir and rdir.exists():
-            for md_file in rdir.glob("*_task*_seg*.md"):
-                report_contents[md_file.stem.split("_", 1)[1]] = md_file.read_text(encoding="utf-8")
-            # タスクまとめファイルも読む
-            for md_file in rdir.glob("*_task[0-9]*.md"):
-                if "_seg" not in md_file.name:
-                    key = md_file.stem.split("_", 1)[1]
-                    report_contents[key] = md_file.read_text(encoding="utf-8")
-
-        # セグメントにレポート内容を付与
-        for seg in seg_map:
-            ti, si = seg["task_index"], seg["seg_index"]
-            seg_key = f"task{ti}_seg{si}"
-            task_key = f"task{ti}"
-            seg["report_segment"] = report_contents.get(seg_key, None)
-            seg["report_task_summary"] = report_contents.get(task_key, None)
-
-        # 日別にグループ化
-        daily: dict[str, dict] = {}
-        for b in blocks:
-            date_key = b.start.strftime("%Y-%m-%d")
-            if date_key not in daily:
-                daily[date_key] = {"active_minutes": 0.0, "blocks": 0, "segments": []}
-            daily[date_key]["active_minutes"] += (b.end - b.start).total_seconds() / 60
-            daily[date_key]["blocks"] += 1
-
-        for seg in seg_map:
-            for date in seg["dates"]:
-                if date in daily:
-                    daily[date]["segments"].append({
-                        "task_index": seg["task_index"],
-                        "seg_index": seg["seg_index"],
-                        "keywords": seg["keywords"],
-                        "branches": seg["branches"],
-                        "time_range": seg["time_range"],
-                        "duration_minutes": seg["duration_minutes"],
-                        "has_report": seg["report_segment"] is not None,
-                        "report_excerpt": (
-                            seg["report_segment"][:500] if seg["report_segment"] else None
-                        ),
+        commits = []
+        current_commit = None
+        for line in result2.stdout.split("\n"):
+            if "|" in line and len(line.split("|")) == 4:
+                parts = line.split("|")
+                current_commit = {
+                    "hash": parts[0][:8],
+                    "message": parts[1],
+                    "author": parts[2],
+                    "date": parts[3].strip(),
+                    "files": [],
+                }
+                commits.append(current_commit)
+            elif current_commit and line.strip() and "\t" in line:
+                parts = line.split("\t")
+                if len(parts) >= 3:
+                    current_commit["files"].append({
+                        "added": parts[0],
+                        "deleted": parts[1],
+                        "path": parts[2],
                     })
 
-        # 日付ソートして返す
-        result_days = {}
-        for date in sorted(daily.keys()):
-            d = daily[date]
-            result_days[date] = {
-                "active_hours": round(d["active_minutes"] / 60, 1),
-                "active_minutes": round(d["active_minutes"], 1),
-                "blocks": d["blocks"],
-                "segments": d["segments"],
+        # ブランチ名に関連するコミットをフィルタ（ベストエフォート）
+        branch_short = branch.split("/")[-1] if "/" in branch else branch
+        filtered = []
+        for c in commits:
+            # ブランチ名の一部がコミットメッセージに含まれる or 全部返す
+            if branch_short.lower() in c["message"].lower() or not branch_short:
+                filtered.append(c)
+
+        return filtered[:10] if filtered else commits[:5]
+    except Exception:
+        return []
+
+
+def _get_pr_info(repo_dir: Path, pr_numbers: list[int]) -> list[dict]:
+    """GitHub PRの情報（タイトル、コメント）を取得."""
+    results = []
+    for pr_num in pr_numbers[:3]:  # 最大3件
+        try:
+            result = subprocess.run(
+                ["gh", "pr", "view", str(pr_num), "--json",
+                 "title,body,comments,reviews,url"],
+                capture_output=True, text=True, timeout=15,
+                cwd=str(repo_dir),
+            )
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                pr_info = {
+                    "number": pr_num,
+                    "title": data.get("title", ""),
+                    "url": data.get("url", ""),
+                    "body": (data.get("body", "") or "")[:500],
+                    "comments": [
+                        {"author": c.get("author", {}).get("login", ""),
+                         "body": c.get("body", "")[:300]}
+                        for c in (data.get("comments", []) or [])[:5]
+                    ],
+                    "reviews": [
+                        {"author": r.get("author", {}).get("login", ""),
+                         "state": r.get("state", ""),
+                         "body": (r.get("body", "") or "")[:300]}
+                        for r in (data.get("reviews", []) or [])[:5]
+                    ],
+                }
+                results.append(pr_info)
+        except Exception:
+            pass
+    return results
+
+
+def _generate_excerpt(
+    blocks: list[Block],
+    block_idxs: list[int],
+    branch: str,
+    keywords: list[str],
+    commits: list[dict],
+    pr_info: list[dict],
+) -> str:
+    """Haikuで作業要約を生成."""
+    # メッセージ収集
+    messages = []
+    total_chars = 0
+    for bi in block_idxs:
+        b = blocks[bi]
+        for msg in b.messages:
+            if total_chars + len(msg) > 30000:
+                break
+            messages.append(f"[{b.start.strftime('%H:%M')}] {msg}")
+            total_chars += len(msg)
+
+    messages_text = "\n".join(messages)
+
+    # コミット情報
+    commit_text = ""
+    if commits:
+        commit_lines = []
+        for c in commits[:5]:
+            files_str = ", ".join(f["path"] for f in c.get("files", [])[:5])
+            commit_lines.append(f"- {c['hash']} {c['message']} ({files_str})")
+        commit_text = "\n## コミット\n" + "\n".join(commit_lines)
+
+    # PR情報
+    pr_text = ""
+    if pr_info:
+        pr_lines = []
+        for pr in pr_info:
+            pr_lines.append(f"- PR #{pr['number']}: {pr['title']}")
+            if pr.get("body"):
+                pr_lines.append(f"  説明: {pr['body'][:200]}")
+            for c in pr.get("comments", []):
+                pr_lines.append(f"  @{c['author']}: {c['body'][:150]}")
+            for r in pr.get("reviews", []):
+                pr_lines.append(f"  Review({r['state']}) @{r['author']}: {r['body'][:150]}")
+        pr_text = "\n## PR\n" + "\n".join(pr_lines)
+
+    time_range = f"{blocks[block_idxs[0]].start.strftime('%H:%M')}~{blocks[block_idxs[-1]].end.strftime('%H:%M')}"
+    dur = sum((blocks[bi].end - blocks[bi].start).total_seconds() / 60 for bi in block_idxs)
+
+    prompt = (
+        "以下の作業セッションを2-3文で簡潔に要約してください。\n"
+        "具体的に何をしたか、結果はどうだったかを含めてください。\n\n"
+        f"ブランチ: {branch}\n"
+        f"時間: {time_range} ({format_duration(dur)})\n"
+        f"キーワード: {', '.join(keywords)}\n"
+        f"{commit_text}\n{pr_text}\n\n"
+        f"## ユーザーメッセージ\n{messages_text}\n\n"
+        "要約のみを出力してください。"
+    )
+
+    try:
+        result = subprocess.run(
+            ["claude", "-p", "--model", "haiku"],
+            input=prompt,
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()[:500]
+    except Exception:
+        pass
+    return ""
+
+
+def _collect_raw_messages(
+    date: str,
+    start_time: str | None,
+    end_time: str | None,
+    project: str | None,
+) -> list[dict]:
+    """JSONLから指定期間の生メッセージを収集."""
+    date_start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=JST)
+    if start_time:
+        h, m = start_time.split(":")
+        date_start = date_start.replace(hour=int(h), minute=int(m))
+
+    date_end = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=JST) + timedelta(days=1)
+    if end_time:
+        h, m = end_time.split(":")
+        date_end = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=JST).replace(
+            hour=int(h), minute=int(m)
+        )
+
+    messages = []
+    for proj_dir in sorted(_PROJECTS_DIR.iterdir()):
+        if not proj_dir.is_dir():
+            continue
+        proj_name = proj_dir.name
+        short = re.sub(r"C--Users-[^-]+-Documents-", "", proj_name)
+        short = re.sub(r"C--Users-[^-]+-", "~/", short)
+
+        if project and project.lower() not in short.lower():
+            continue
+
+        for jsonl_path in proj_dir.glob("*.jsonl"):
+            if jsonl_path.stat().st_size < 500:
+                continue
+            try:
+                with open(jsonl_path, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        try:
+                            d = json.loads(line)
+                            if d.get("type") != "user":
+                                continue
+                            ts = parse_timestamp(d.get("timestamp", ""))
+                            if ts is None or ts < date_start or ts >= date_end:
+                                continue
+
+                            msg = d.get("message", {})
+                            content = msg.get("content", "")
+                            if isinstance(content, list):
+                                texts = [
+                                    c.get("text", "")
+                                    for c in content
+                                    if isinstance(c, dict) and c.get("type") == "text"
+                                ]
+                                content = " ".join(texts)
+                            if not isinstance(content, str) or len(content.strip()) < 4:
+                                continue
+
+                            branch = d.get("gitBranch", "") or ""
+                            messages.append({
+                                "time": ts.strftime("%H:%M"),
+                                "branch": branch.split("/")[-1] if "/" in branch else branch,
+                                "text": content[:500],
+                            })
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+            except OSError:
+                continue
+
+    messages.sort(key=lambda x: x["time"])
+    return messages
+
+
+# =====================================================================
+# MCP Tools (3 user-facing tools)
+# =====================================================================
+
+
+@mcp.tool()
+def timecard_day(
+    date: str,
+    project: str | None = None,
+    generate_excerpts: bool = True,
+) -> str:
+    """特定の日の作業時間を、ブランチ別にグループ化して返す。
+
+    各ブランチグループにはキーワード、PR情報（コメント含む）、コミット情報（ファイル変更含む）、
+    AIによる作業要約が含まれる。タイムシート作成に最適。
+
+    Args:
+        date: 対象日 (YYYY-MM-DD形式)。例: "2026-03-27"
+        project: プロジェクト名フィルタ (部分一致)。例: "prefab"
+        generate_excerpts: trueならAI要約を生成（Haiku使用、ブランチ数×1回）。falseならスキップ
+    """
+    with contextlib.redirect_stdout(sys.stderr):
+        events, blocks, tfidf = _load_data(date, date, project)
+        if not events:
+            return json.dumps({"_meta": _META, "error": "該当日のデータがありません"}, ensure_ascii=False)
+
+        # ブランチ別にブロックをグループ化
+        branch_groups: dict[str, list[int]] = defaultdict(list)
+        for i, b in enumerate(blocks):
+            branch = _block_branch_summary(b.branches) or "main"
+            branch_groups[branch].append(i)
+
+        # プロジェクトディレクトリ推定（git/PR情報用）
+        project_dirs: list[Path] = []
+        if project:
+            repo = _resolve_project_dir(project)
+            if repo:
+                project_dirs.append(repo)
+
+        # 各ブランチグループの情報を構築
+        groups = []
+        excerpt_jobs = []
+
+        for branch, idxs in sorted(branch_groups.items(), key=lambda x: -len(x[1])):
+            group_blocks = [blocks[i] for i in idxs]
+            active_min = sum((b.end - b.start).total_seconds() / 60 for b in group_blocks)
+            time_ranges = []
+            # 連続ブロックをまとめて時間帯にする
+            current_start = group_blocks[0].start
+            current_end = group_blocks[0].end
+            for b in group_blocks[1:]:
+                gap = (b.start - current_end).total_seconds() / 60
+                if gap > 30:
+                    time_ranges.append(f"{current_start.strftime('%H:%M')}~{current_end.strftime('%H:%M')}")
+                    current_start = b.start
+                current_end = b.end
+            time_ranges.append(f"{current_start.strftime('%H:%M')}~{current_end.strftime('%H:%M')}")
+
+            # キーワード
+            all_kw: Counter = Counter()
+            for b in group_blocks:
+                for w, _ in extract_keywords(b.messages, 5, tfidf):
+                    all_kw[w] += 1
+            top_keywords = [w for w, _ in all_kw.most_common(8)]
+
+            # プロジェクト
+            all_projects = sorted({p for b in group_blocks for p in b.projects})
+
+            # PR番号
+            all_prs = sorted({n for b in group_blocks for n in b.pr_numbers})
+
+            # コミット/PR情報（ベストエフォート）
+            commits = []
+            pr_info = []
+            for repo in project_dirs:
+                commits = _get_git_commits(repo, branch, date)
+                if all_prs:
+                    pr_info = _get_pr_info(repo, all_prs)
+                break
+
+            group = {
+                "branch": branch,
+                "projects": all_projects,
+                "active_hours": round(active_min / 60, 1),
+                "active_minutes": round(active_min, 1),
+                "time_ranges": time_ranges,
+                "blocks": len(idxs),
+                "turns": sum(b.turns for b in group_blocks),
+                "keywords": top_keywords,
+                "pr_numbers": all_prs,
+                "pr_info": pr_info,
+                "commits": commits[:10],
+                "ai_excerpt": None,
             }
+            groups.append(group)
+
+            if generate_excerpts:
+                excerpt_jobs.append((branch, idxs, top_keywords, commits, pr_info, len(groups) - 1))
+
+        # AI excerpt生成（並列）
+        if excerpt_jobs:
+            def _run_excerpt(job):
+                branch, idxs, kws, commits, prs, idx = job
+                excerpt = _generate_excerpt(blocks, idxs, branch, kws, commits, prs)
+                return idx, excerpt
+
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                futures = [executor.submit(_run_excerpt, job) for job in excerpt_jobs]
+                for future in as_completed(futures):
+                    try:
+                        idx, excerpt = future.result()
+                        groups[idx]["ai_excerpt"] = excerpt
+                    except Exception:
+                        pass
+
+        # 全体サマリー
+        total_active = sum(g["active_minutes"] for g in groups)
 
     return json.dumps({
         "_meta": _META,
-        "days": result_days,
-        "total_segments": len(seg_map),
-        "report_dir": str(rdir) if rdir else None,
-        "report_files_found": len(report_contents),
+        "date": date,
+        "active_hours": round(total_active / 60, 1),
+        "active_minutes": round(total_active, 1),
+        "total_blocks": sum(g["blocks"] for g in groups),
+        "total_turns": sum(g["turns"] for g in groups),
+        "branch_groups": groups,
     }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def timecard_conversation(
+    date: str,
+    project: str | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+) -> str:
+    """指定日の会話内容（ユーザーメッセージ）を時系列で返す。
+
+    タイムシートの作業内容を正確に記述するための根拠データ。
+    AI要約では不十分な場合に、実際の会話内容を確認するために使う。
+
+    Args:
+        date: 対象日 (YYYY-MM-DD)
+        project: プロジェクト名フィルタ
+        start_time: 開始時刻 (HH:MM)。省略時はその日の最初から
+        end_time: 終了時刻 (HH:MM)。省略時はその日の最後まで
+    """
+    with contextlib.redirect_stdout(sys.stderr):
+        messages = _collect_raw_messages(date, start_time, end_time, project)
+
+    return json.dumps({
+        "_meta": _META,
+        "date": date,
+        "time_range": f"{start_time or '00:00'}~{end_time or '23:59'}",
+        "message_count": len(messages),
+        "messages": messages[:200],  # 最大200件
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def timecard_register(
+    type: str,
+    words: list[str] | None = None,
+    canonical: str | None = None,
+    aliases: list[str] | None = None,
+    sudachi_path: str | None = None,
+) -> str:
+    """キーワード精度を改善するための登録ツール。
+
+    同義語、ストップワード、Sudachi辞書インポートの3つの機能を提供。
+
+    使い方:
+    - ストップワード追加: type="stopword", words=["ultrathink", "一旦"]
+    - 同義語追加: type="synonym", canonical="deploy", aliases=["デプロイ"]
+    - Sudachi辞書インポート: type="sudachi", sudachi_path="https://..."
+
+    Args:
+        type: "stopword" / "synonym" / "sudachi"
+        words: ストップワードのリスト (type="stopword" 時)
+        canonical: 同義語の正規形 (type="synonym" 時)
+        aliases: 同義語の別名リスト (type="synonym" 時)
+        sudachi_path: Sudachi synonyms.txt のパスまたはURL (type="sudachi" 時)
+    """
+    with contextlib.redirect_stdout(sys.stderr):
+        if type == "stopword":
+            if not words:
+                return json.dumps({"error": "words を指定してください"}, ensure_ascii=False)
+            _add_stopwords(words)
+            return json.dumps({
+                "_meta": _META,
+                "action": "stopword_added",
+                "words": words,
+                "message": f"{len(words)}語をストップワードに追加しました",
+            }, ensure_ascii=False, indent=2)
+
+        elif type == "synonym":
+            if not canonical or not aliases:
+                return json.dumps({"error": "canonical と aliases を指定してください"}, ensure_ascii=False)
+            add_synonym(canonical, aliases)
+            return json.dumps({
+                "_meta": _META,
+                "action": "synonym_added",
+                "canonical": canonical,
+                "aliases": aliases,
+                "message": f"同義語登録: {canonical} ← {', '.join(aliases)}",
+                "saved_to": "~/.config/claude-timecard/synonyms.json",
+            }, ensure_ascii=False, indent=2)
+
+        elif type == "sudachi":
+            if not sudachi_path:
+                return json.dumps({"error": "sudachi_path を指定してください"}, ensure_ascii=False)
+            count = import_sudachi_synonyms(sudachi_path)
+            return json.dumps({
+                "_meta": _META,
+                "action": "sudachi_imported",
+                "groups_imported": count,
+                "message": f"Sudachi同義語辞書から{count}グループをインポートしました",
+                "saved_to": "~/.config/claude-timecard/synonyms.json",
+            }, ensure_ascii=False, indent=2)
+
+        else:
+            return json.dumps({"error": f"不明なtype: {type}。stopword/synonym/sudachi のいずれかを指定"}, ensure_ascii=False)
 
 
 if __name__ == "__main__":

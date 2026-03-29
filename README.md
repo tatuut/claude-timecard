@@ -57,16 +57,11 @@ Works as an MCP server for Claude Code. Add to `~/.claude.json`:
 
 Then just ask Claude Code in natural language:
 
-| Tool | Example |
-|------|---------|
-| `timecard_daily` | "Show me daily active hours this week" |
-| `timecard_detail` | "What was I doing on 3/23 afternoon?" |
-| `timecard_streams` | "Time per branch?" |
-| `timecard_tasks` | "Task list for this month" |
-| `timecard_keywords` | "Top keywords?" |
-| `timecard_compare_months` | "Compare Feb vs March" |
-| `timecard_report` | "Write a weekly report" |
-| `timecard_graph` | "Generate graphs" |
+| Tool | What it does | Example |
+|------|-------------|---------|
+| `timecard_day` | Full day view — branch groups, keywords, PR info (with comments), commits (with file changes), AI-generated work summary | "What did I do on 3/27?" |
+| `timecard_conversation` | Raw user messages for a date/time range | "Show me the conversation from 3/27 afternoon" |
+| `timecard_register` | Add synonyms, stopwords, or import Sudachi dictionary | "Add 'ultrathink' as a stopword" |
 
 ## Customization
 
@@ -151,22 +146,27 @@ Registries (`extractors/`, `signals/`) are extensible — drop in a file + `@reg
 
 ## For AI agents (Claude Code / MCP)
 
-The MCP server wraps all tool functions with `contextlib.redirect_stdout(sys.stderr)` to prevent `print()` from corrupting the stdio JSON-RPC transport.
+The MCP server exposes 3 tools. All wrap functions with `contextlib.redirect_stdout(sys.stderr)` to prevent `print()` from corrupting the stdio JSON-RPC transport.
 
-Synonym and stopword management commands:
+### `timecard_day(date, project, generate_excerpts)`
 
-```bash
-# Add synonym (saved to ~/.config/claude-timecard/synonyms.json)
-python timecard.py --add-synonym <canonical> <alias1> [alias2 ...]
+Returns a single day's work grouped by branch. Each branch group includes:
+- `active_hours`, `time_ranges`, `keywords`
+- `pr_numbers`, `pr_info` (title, body, comments, reviews)
+- `commits` (hash, message, file changes)
+- `ai_excerpt` (Haiku-generated 2-3 sentence summary)
 
-# Add stopword (saved to stopwords.json under "ユーザー追加" category)
-python timecard.py --add-stop <word1> [word2 ...]
+When building a timesheet, use `ai_excerpt` as the basis for the "work description" column. If the excerpt is insufficient, call `timecard_conversation` to read the raw messages.
 
-# Import Sudachi synonym dictionary
-python timecard.py --import-sudachi <path-or-url>
-```
+### `timecard_conversation(date, project, start_time, end_time)`
 
-When a user asks to merge keywords or exclude noise words, use these commands. Changes take effect on the next analysis run.
+Returns raw user messages for a date/time range. Use this to verify what was actually discussed when the AI summary needs more detail.
+
+### `timecard_register(type, ...)`
+
+- `type="stopword"`, `words=[...]` — exclude noise keywords
+- `type="synonym"`, `canonical="...", aliases=[...]` — merge keyword variants
+- `type="sudachi"`, `sudachi_path="..."` — bulk import from Sudachi dictionary
 
 ## License
 
