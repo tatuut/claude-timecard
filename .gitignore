@@ -14,6 +14,9 @@ private/
 .temp_files.json
 calibration.json
 
+# デバッグ
+debug.log
+
 # キャッシュ
 .pytest_cache/
 .ruff_cache/

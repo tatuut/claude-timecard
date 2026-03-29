@@ -41,6 +41,15 @@ mcp = FastMCP("claude-timecard")
 
 _PROJECTS_DIR = Path.home() / ".claude" / "projects"
 _META = {"tool": ATTRIBUTION_SHORT, "license": "AGPL-3.0"}
+_LOG_FILE = Path(__file__).parent / "debug.log"
+
+
+def _log(msg: str):
+    """デバッグログをファイルに書き出す."""
+    import time as _t
+    with open(_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"[{_t.strftime('%H:%M:%S')}] {msg}\n")
+        f.flush()
 
 
 # --- internal helpers ---
@@ -392,10 +401,10 @@ def timecard_day(
     with contextlib.redirect_stdout(sys.stderr):
         import time as _time
         _t0 = _time.perf_counter()
-        print(f"[timecard_day] START date={date} project={project} excerpts={generate_excerpts}", file=sys.stderr, flush=True)
+        _log(f"[timecard_day] START date={date} project={project} excerpts={generate_excerpts}", file=sys.stderr, flush=True)
 
         events, blocks, tfidf = _load_data(date, date, project)
-        print(f"[timecard_day] _load_data: {_time.perf_counter()-_t0:.2f}s events={len(events)} blocks={len(blocks)}", file=sys.stderr, flush=True)
+        _log(f"[timecard_day] _load_data: {_time.perf_counter()-_t0:.2f}s events={len(events)} blocks={len(blocks)}", file=sys.stderr, flush=True)
         if not events:
             return json.dumps({"_meta": _META, "error": "該当日のデータがありません"}, ensure_ascii=False)
 
@@ -404,7 +413,7 @@ def timecard_day(
         for i, b in enumerate(blocks):
             branch = _block_branch_summary(b.branches) or "main"
             branch_groups[branch].append(i)
-        print(f"[timecard_day] branch_groups: {len(branch_groups)} groups", file=sys.stderr, flush=True)
+        _log(f"[timecard_day] branch_groups: {len(branch_groups)} groups", file=sys.stderr, flush=True)
 
         # プロジェクトディレクトリ推定（git/PR情報用）
         project_dirs: list[Path] = []
@@ -412,7 +421,7 @@ def timecard_day(
             repo = _resolve_project_dir(project)
             if repo:
                 project_dirs.append(repo)
-        print(f"[timecard_day] resolve_project: {project_dirs}", file=sys.stderr, flush=True)
+        _log(f"[timecard_day] resolve_project: {project_dirs}", file=sys.stderr, flush=True)
 
         # 各ブランチグループの情報を構築
         groups = []
@@ -455,7 +464,7 @@ def timecard_day(
                 if all_prs:
                     pr_info = _get_pr_info(repo, all_prs)
                 break
-            print(f"[timecard_day]   git/pr {branch}: {_time.perf_counter()-_tg:.2f}s commits={len(commits)} prs={len(pr_info)}", file=sys.stderr, flush=True)
+            _log(f"[timecard_day]   git/pr {branch}: {_time.perf_counter()-_tg:.2f}s commits={len(commits)} prs={len(pr_info)}", file=sys.stderr, flush=True)
 
             group = {
                 "branch": branch,
@@ -478,15 +487,15 @@ def timecard_day(
 
         # AI excerpt生成（並列）
         if excerpt_jobs:
-            print(f"[timecard_day] excerpt_jobs: {len(excerpt_jobs)} starting parallel...", file=sys.stderr, flush=True)
+            _log(f"[timecard_day] excerpt_jobs: {len(excerpt_jobs)} starting parallel...", file=sys.stderr, flush=True)
             _te = _time.perf_counter()
 
             def _run_excerpt(job):
                 branch, idxs, kws, commits, prs, idx = job
                 _ts = _time.perf_counter()
-                print(f"[timecard_day]   excerpt START [{idx}] {branch}", file=sys.stderr, flush=True)
+                _log(f"[timecard_day]   excerpt START [{idx}] {branch}", file=sys.stderr, flush=True)
                 excerpt = _generate_excerpt(blocks, idxs, branch, kws, commits, prs)
-                print(f"[timecard_day]   excerpt DONE  [{idx}] {branch} {_time.perf_counter()-_ts:.2f}s len={len(excerpt)}", file=sys.stderr, flush=True)
+                _log(f"[timecard_day]   excerpt DONE  [{idx}] {branch} {_time.perf_counter()-_ts:.2f}s len={len(excerpt)}", file=sys.stderr, flush=True)
                 return idx, excerpt
 
             with ThreadPoolExecutor(max_workers=5) as executor:
@@ -496,11 +505,11 @@ def timecard_day(
                         idx, excerpt = future.result()
                         groups[idx]["ai_excerpt"] = excerpt
                     except Exception as e:
-                        print(f"[timecard_day]   excerpt ERROR: {e}", file=sys.stderr, flush=True)
+                        _log(f"[timecard_day]   excerpt ERROR: {e}", file=sys.stderr, flush=True)
 
-            print(f"[timecard_day] excerpts total: {_time.perf_counter()-_te:.2f}s", file=sys.stderr, flush=True)
+            _log(f"[timecard_day] excerpts total: {_time.perf_counter()-_te:.2f}s", file=sys.stderr, flush=True)
 
-        print(f"[timecard_day] TOTAL: {_time.perf_counter()-_t0:.2f}s", file=sys.stderr, flush=True)
+        _log(f"[timecard_day] TOTAL: {_time.perf_counter()-_t0:.2f}s", file=sys.stderr, flush=True)
 
         # 全体サマリー
         total_active = sum(g["active_minutes"] for g in groups)
